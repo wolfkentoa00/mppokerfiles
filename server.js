@@ -6,20 +6,13 @@ const path = require('path');
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
-    cors: { origin: "*" } // Allow connections from anywhere
+    cors: { origin: "*" }
 });
 
-// Serve static files (HTML) from the 'public' folder
-// Folder structure should be:
-// - server.js
-// - public/
-//   - index.html
 app.use(express.static(path.join(__dirname, 'public')));
 
-// --- Game State ---
 const rooms = {};
 
-// Deck Helpers
 const SUITS = ['h', 'd', 'c', 's'];
 const RANKS = ['2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K', 'A'];
 
@@ -33,13 +26,18 @@ function createDeck() {
     return deck;
 }
 
-// --- Socket Logic ---
 io.on('connection', (socket) => {
     console.log('User connected:', socket.id);
 
-    socket.on('createRoom', ({ name }) => {
+    // Create Room with Custom Stack
+    socket.on('createRoom', ({ name, startStack }) => {
         const roomCode = Math.floor(100000 + Math.random() * 900000).toString();
+        
+        // Default to 1000 if not provided
+        const initialChips = parseInt(startStack) || 1000;
+
         rooms[roomCode] = {
+            roomCode: roomCode, // Store code inside room for ref
             status: 'waiting',
             stage: 'preflop',
             pot: 0,
@@ -48,12 +46,12 @@ io.on('connection', (socket) => {
             deck: [],
             turnIndex: 0,
             players: [],
-            hostId: socket.id
+            hostId: socket.id,
+            startStack: initialChips // Save for future joiners
         };
         socket.join(roomCode);
         
-        // Add Host Player
-        const player = { id: socket.id, name, chips: 1000, hand: [], bet: 0, status: 'active', totalInvested: 0 };
+        const player = { id: socket.id, name, chips: initialChips, hand: [], bet: 0, status: 'active', totalInvested: 0 };
         rooms[roomCode].players.push(player);
 
         socket.emit('roomCreated', { roomCode, userId: socket.id });
@@ -66,7 +64,8 @@ io.on('connection', (socket) => {
         if (room.status !== 'waiting') return socket.emit('error', 'Game in progress');
 
         socket.join(roomCode);
-        const player = { id: socket.id, name, chips: 1000, hand: [], bet: 0, status: 'active', totalInvested: 0 };
+        // Use the room's startStack setting
+        const player = { id: socket.id, name, chips: room.startStack, hand: [], bet: 0, status: 'active', totalInvested: 0 };
         room.players.push(player);
 
         socket.emit('joinedRoom', { roomCode, userId: socket.id });
@@ -78,15 +77,14 @@ io.on('connection', (socket) => {
         if (!room || room.hostId !== socket.id) return;
         if (room.players.length < 2) return socket.emit('error', 'Need 2+ players');
 
-        // Init Game
         room.deck = createDeck();
         room.status = 'playing';
         room.stage = 'preflop';
         room.pot = 0;
         room.currentBet = 0;
         room.communityCards = [];
+        room.winnerMessage = null;
         
-        // Deal Cards
         room.players.forEach(p => {
             p.hand = [room.deck.pop(), room.deck.pop()];
             p.status = 'active';
@@ -101,16 +99,15 @@ io.on('connection', (socket) => {
         if (!room) return;
 
         const playerIndex = room.players.findIndex(p => p.id === socket.id);
-        if (playerIndex !== room.turnIndex) return; // Not your turn
+        if (playerIndex !== room.turnIndex) return; 
 
         const player = room.players[playerIndex];
 
-        // Logic
         if (action === 'fold') {
             player.status = 'folded';
         } else if (action === 'call' || action === 'check') {
             const cost = room.currentBet - player.bet;
-            if(cost > player.chips) { // All in
+            if(cost >= player.chips) { 
                 room.pot += player.chips;
                 player.bet += player.chips;
                 player.chips = 0;
@@ -126,11 +123,10 @@ io.on('connection', (socket) => {
                 player.chips -= cost;
                 player.bet += cost;
                 room.pot += cost;
-                room.currentBet = player.bet; // Raise the table bet
+                room.currentBet = player.bet; 
             }
         }
 
-        // Move Turn
         let nextIndex = (room.turnIndex + 1) % room.players.length;
         let attempts = 0;
         while(room.players[nextIndex].status !== 'active' && attempts < room.players.length) {
@@ -139,15 +135,12 @@ io.on('connection', (socket) => {
         }
         room.turnIndex = nextIndex;
 
-        // Check for stage advancement (Simplified: if everyone matched bets)
-        // Note: Real poker logic for side-pots/all-in is complex, this is basic flow
         const activePlayers = room.players.filter(p => p.status === 'active');
         const allMatched = activePlayers.every(p => p.bet === room.currentBet || p.chips === 0);
         
         if(allMatched && activePlayers.length > 1) {
             advanceStage(room);
         } else if (activePlayers.length === 1) {
-             // Everyone else folded
              endHand(room, activePlayers[0]);
         }
 
@@ -155,7 +148,6 @@ io.on('connection', (socket) => {
     });
 
     const advanceStage = (room) => {
-        // Reset Bets
         room.players.forEach(p => p.bet = 0);
         room.currentBet = 0;
 
@@ -170,9 +162,10 @@ io.on('connection', (socket) => {
             room.communityCards.push(room.deck.pop());
         } else if (room.stage === 'river') {
             room.stage = 'showdown';
-            // Evaluate Winner (Basic High Card/Random for demo server)
-            // Ideally import the evaluator here
-            const winner = room.players.find(p => p.status === 'active'); 
+            // Evaluate Winner (Basic logic, replace with real evaluator if needed)
+            const active = room.players.filter(p => p.status === 'active');
+            // Random winner for demo purposes if no evaluator lib present
+            const winner = active[0]; 
             endHand(room, winner);
             return;
         }
@@ -182,15 +175,20 @@ io.on('connection', (socket) => {
         winner.chips += room.pot;
         room.pot = 0;
         room.winnerMessage = `${winner.name} wins!`;
-        room.status = 'finished'; // Client can see result then request next hand
+        room.status = 'finished'; // UI uses this to show cards
         
-        // Auto restart after 5s
         setTimeout(() => {
+            // New Hand Reset
             room.status = 'playing';
             room.stage = 'preflop';
             room.deck = createDeck();
             room.communityCards = [];
             room.winnerMessage = null;
+            room.currentBet = 0;
+            
+            // Rotate Dealer/Turn (Simple rotate)
+            // Ideally track dealer button
+            
             room.players.forEach(p => {
                 if(p.chips > 0) {
                     p.status = 'active';
@@ -200,18 +198,18 @@ io.on('connection', (socket) => {
                     p.status = 'busted';
                 }
             });
-            io.to(room.hostId).emit('gameState', room); // Or broadcast
-            io.to(room.hostId).emit('requestNextHand'); // Or handle on server
-        }, 5000);
+            // Reset turn to host for simplicity or rotate
+            room.turnIndex = 0; 
+            
+            io.to(room.roomCode).emit('gameState', room);
+        }, 8000); // 8 Seconds to see cards
     };
 
     socket.on('disconnect', () => {
-        console.log('User disconnected');
-        // Handle cleanup
+        // Optional: Remove player from room or mark disconnected
     });
 });
 
-// Use process.env.PORT for deployment (Heroku/Render) or 3000 for local
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
